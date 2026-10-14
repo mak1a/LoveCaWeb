@@ -1,1 +1,8 @@
+# Preserve build bytes so build-manifest.json also verifies on Linux.
+* -text
 index.data filter=lfs diff=lfs merge=lfs -text
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
