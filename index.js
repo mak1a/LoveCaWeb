@@ -457,6 +457,129 @@ Module['preRun'].push(function () {
     Module['postRun'].push(mount);
 })();
 
+Module['loveCaAuthConfig'] = {"googleClientId": "560482442660-a59t1r0rp6l9v4po44el0289fraiheaj.apps.googleusercontent.com"};
+
+// A fresh Google ID token is kept only in memory and consumed by Photon once.
+(function () {
+  'use strict';
+  function createAuthController(env) {
+    const win = env.window, doc = env.document;
+    let state = 0, error = '', generation = 0, credential = null, dialog = null;
+    let googleLoading;
+    function closeDialog() {
+      if (dialog) { dialog.close(); dialog.remove(); dialog = null; }
+    }
+    function cancel() {
+      generation++;
+      credential = null;
+      state = 3;
+      closeDialog();
+    }
+    function fail(message) {
+      credential = null;
+      error = message;
+      state = 4;
+      closeDialog();
+    }
+    function loadGoogle() {
+      if (win.google && win.google.accounts && win.google.accounts.id) return Promise.resolve();
+      if (!googleLoading) googleLoading = new Promise((resolve, reject) => {
+        const script = doc.createElement('script');
+        script.src = 'https://accounts.google.com/gsi/client';
+        script.async = true;
+        const timer = win.setTimeout(() => { script.remove(); reject(new Error('Google load timeout')); }, 15000);
+        script.onload = () => { win.clearTimeout(timer); resolve(); };
+        script.onerror = () => { win.clearTimeout(timer); script.remove(); reject(new Error('Google load failed')); };
+        doc.head.appendChild(script);
+      }).catch(error => { googleLoading = null; throw error; });
+      return googleLoading;
+    }
+    function takePhotonData() {
+      if (state !== 2 || !credential) return '';
+      const value = credential;
+      credential = null;
+      state = 0;
+      if (value.expiresAt <= env.now()) return '';
+      return JSON.stringify({ idToken: value.idToken, nonce: value.nonce });
+    }
+    async function begin() {
+      cancel();
+      const current = ++generation;
+      state = 1;
+      error = '';
+      const clientId = env.config.googleClientId;
+      if (typeof clientId !== 'string' || !/^\d+-[a-z0-9]+\.apps\.googleusercontent\.com$/.test(clientId)) {
+        fail('オンライン対戦のログイン設定が未完了です。管理者に連絡してください。');
+        return;
+      }
+      const bytes = new Uint8Array(32);
+      win.crypto.getRandomValues(bytes);
+      const nonce = Array.from(bytes, value => value.toString(16).padStart(2, '0')).join('');
+      dialog = doc.createElement('dialog');
+      dialog.setAttribute('aria-labelledby', 'loveca-auth-title');
+      dialog.style.cssText = 'border:0;border-radius:16px;padding:28px;max-width:420px;width:calc(100% - 80px);font-family:system-ui,sans-serif;color:#17324c;box-shadow:0 16px 64px #0008;z-index:1000';
+      const title = doc.createElement('h2');
+      title.id = 'loveca-auth-title';
+      title.textContent = 'オンライン対戦にログイン';
+      title.style.cssText = 'font-size:clamp(18px,5vw,24px);line-height:1.5;margin:0 0 16px';
+      const message = doc.createElement('p');
+      message.textContent = '利用を許可されたGoogleアカウントでログインしてください。メールアドレスは対戦相手に表示されません。';
+      message.style.cssText = 'font-size:16px;line-height:1.8';
+      const button = doc.createElement('div');
+      button.style.cssText = 'margin:24px 0;min-height:44px';
+      button.textContent = 'Googleログインを読み込んでいます…';
+      const back = doc.createElement('button');
+      back.type = 'button';
+      back.textContent = 'タイトルへ戻る';
+      back.style.cssText = 'padding:10px 16px;border:1px solid #aab8c5;border-radius:8px;background:white;color:#17324c;cursor:pointer;font:inherit';
+      back.addEventListener('click', cancel);
+      dialog.addEventListener('cancel', event => { event.preventDefault(); cancel(); });
+      // Keep typing in the modal from reaching the game canvas.
+      dialog.addEventListener('keydown', event => event.stopPropagation());
+      dialog.append(title, message, button, back);
+      doc.body.appendChild(dialog);
+      dialog.showModal();
+      back.focus();
+      try {
+        await loadGoogle();
+        if (current !== generation) return;
+        const google = win.google.accounts.id;
+        google.initialize({
+          client_id: clientId,
+          nonce: nonce,
+          auto_select: false,
+          callback: response => {
+            if (current !== generation || state !== 1) return;
+            try {
+              const token = response.credential;
+              if (typeof token !== 'string' || token.length > 12000 || token.split('.').length !== 3) throw new Error();
+              const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+              const payload = JSON.parse(win.atob(part.padEnd(Math.ceil(part.length / 4) * 4, '=')));
+              // These client checks bind the callback to this sign-in attempt.
+              // The Worker independently verifies the signature and all claims.
+              if (payload.nonce !== nonce || typeof payload.exp !== 'number' || payload.exp * 1000 <= env.now()) throw new Error();
+              credential = { idToken: token, nonce: nonce, expiresAt: payload.exp * 1000 };
+              state = 2;
+              closeDialog();
+            } catch { fail('ログインを確認できませんでした。タイトルへ戻り、もう一度お試しください。'); }
+          },
+        });
+        button.textContent = '';
+        google.renderButton(button, { type: 'standard', theme: 'outline', size: 'large', text: 'signin_with', locale: 'ja' });
+      } catch {
+        if (current === generation) fail('Googleログインを読み込めませんでした。通信環境を確認して、もう一度お試しください。');
+      }
+    }
+    return { begin: () => begin().catch(() => fail('ログインを開始できませんでした。ブラウザーを更新して、もう一度お試しください。')),
+      cancel: cancel, state: () => state, error: () => error, takePhotonData: takePhotonData };
+  }
+  if (typeof module === 'object' && module.exports) module.exports = { createAuthController: createAuthController };
+  if (typeof window !== 'undefined' && typeof Module !== 'undefined') {
+    Module['loveCaAuth'] = createAuthController({ window: window, document: document,
+      config: Module['loveCaAuthConfig'] || {}, now: () => Date.now() });
+  }
+})();
+
 (function() 
 {
     const onAbort = Module["onAbort"] || ((e) => {
@@ -1408,24 +1531,28 @@ var tempI64;
 // === Body ===
 
 var ASM_CONSTS = {
-  2013036: () => { return new URLSearchParams(location.search).get('qa') === '1' ? 1 : 0; },  
- 2013111: ($0) => { console.warn('Photon: ' + UTF8ToString($0).replace(/[a-fA-F0-9]{8}-[a-fA-F0-9-]{27,}|[a-fA-F0-9]{32}/g, '[redacted]')); },  
- 2013235: () => { Module['loveLiveDeckStorage'].restore(); },  
- 2013280: ($0) => { Module['loveLiveDeckStorage'].persist(UTF8ToString($0)); },  
- 2013341: ($0, $1) => { Module['websocket'].subprotocol = UTF8ToString($0); Module['websocket'].url = UTF8ToString($1); if (typeof SOCKFS !== 'undefined') { SOCKFS.websocketArgs['url'] = UTF8ToString($1); SOCKFS.websocketArgs['subprotocol'] = UTF8ToString($0); } },  
- 2013584: () => { setTimeout(function() { _siv3dMaybeAwake(); }, 0) },  
- 2013636: () => { setTimeout(function() { _siv3dMaybeAwake(); }, 0) },  
- 2013688: () => { if (typeof(AudioContext) !== 'undefined') { return true; } else if (typeof(webkitAudioContext) !== 'undefined') { return true; } return false; },  
- 2013835: () => { if ((typeof(navigator.mediaDevices) !== 'undefined') && (typeof(navigator.mediaDevices.getUserMedia) !== 'undefined')) { return true; } else if (typeof(navigator.webkitGetUserMedia) !== 'undefined') { return true; } return false; },  
- 2014069: ($0) => { if(typeof(Module['SDL2']) === 'undefined') { Module['SDL2'] = {}; } var SDL2 = Module['SDL2']; if (!$0) { SDL2.audio = {}; } else { SDL2.capture = {}; } if (!SDL2.audioContext) { if (typeof(AudioContext) !== 'undefined') { SDL2.audioContext = new AudioContext(); } else if (typeof(webkitAudioContext) !== 'undefined') { SDL2.audioContext = new webkitAudioContext(); } if (SDL2.audioContext) { autoResumeAudioContext(SDL2.audioContext); } } return SDL2.audioContext === undefined ? -1 : 0; },  
- 2014562: () => { var SDL2 = Module['SDL2']; return SDL2.audioContext.sampleRate; },  
- 2014630: ($0, $1, $2, $3) => { var SDL2 = Module['SDL2']; var have_microphone = function(stream) { if (SDL2.capture.silenceTimer !== undefined) { clearTimeout(SDL2.capture.silenceTimer); SDL2.capture.silenceTimer = undefined; } SDL2.capture.mediaStreamNode = SDL2.audioContext.createMediaStreamSource(stream); SDL2.capture.scriptProcessorNode = SDL2.audioContext.createScriptProcessor($1, $0, 1); SDL2.capture.scriptProcessorNode.onaudioprocess = function(audioProcessingEvent) { if ((SDL2 === undefined) || (SDL2.capture === undefined)) { return; } audioProcessingEvent.outputBuffer.getChannelData(0).fill(0.0); SDL2.capture.currentCaptureBuffer = audioProcessingEvent.inputBuffer; dynCall('vi', $2, [$3]); }; SDL2.capture.mediaStreamNode.connect(SDL2.capture.scriptProcessorNode); SDL2.capture.scriptProcessorNode.connect(SDL2.audioContext.destination); SDL2.capture.stream = stream; }; var no_microphone = function(error) { }; SDL2.capture.silenceBuffer = SDL2.audioContext.createBuffer($0, $1, SDL2.audioContext.sampleRate); SDL2.capture.silenceBuffer.getChannelData(0).fill(0.0); var silence_callback = function() { SDL2.capture.currentCaptureBuffer = SDL2.capture.silenceBuffer; dynCall('vi', $2, [$3]); }; SDL2.capture.silenceTimer = setTimeout(silence_callback, ($1 / SDL2.audioContext.sampleRate) * 1000); if ((navigator.mediaDevices !== undefined) && (navigator.mediaDevices.getUserMedia !== undefined)) { navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(have_microphone).catch(no_microphone); } else if (navigator.webkitGetUserMedia !== undefined) { navigator.webkitGetUserMedia({ audio: true, video: false }, have_microphone, no_microphone); } },  
- 2016282: ($0, $1, $2, $3) => { var SDL2 = Module['SDL2']; SDL2.audio.scriptProcessorNode = SDL2.audioContext['createScriptProcessor']($1, 0, $0); SDL2.audio.scriptProcessorNode['onaudioprocess'] = function (e) { if ((SDL2 === undefined) || (SDL2.audio === undefined)) { return; } SDL2.audio.currentOutputBuffer = e['outputBuffer']; dynCall('vi', $2, [$3]); }; SDL2.audio.scriptProcessorNode['connect'](SDL2.audioContext['destination']); },  
- 2016692: ($0, $1) => { var SDL2 = Module['SDL2']; var numChannels = SDL2.capture.currentCaptureBuffer.numberOfChannels; for (var c = 0; c < numChannels; ++c) { var channelData = SDL2.capture.currentCaptureBuffer.getChannelData(c); if (channelData.length != $1) { throw 'Web Audio capture buffer length mismatch! Destination size: ' + channelData.length + ' samples vs expected ' + $1 + ' samples!'; } if (numChannels == 1) { for (var j = 0; j < $1; ++j) { setValue($0 + (j * 4), channelData[j], 'float'); } } else { for (var j = 0; j < $1; ++j) { setValue($0 + (((j * numChannels) + c) * 4), channelData[j], 'float'); } } } },  
- 2017297: ($0, $1) => { var SDL2 = Module['SDL2']; var numChannels = SDL2.audio.currentOutputBuffer['numberOfChannels']; for (var c = 0; c < numChannels; ++c) { var channelData = SDL2.audio.currentOutputBuffer['getChannelData'](c); if (channelData.length != $1) { throw 'Web Audio output buffer length mismatch! Destination size: ' + channelData.length + ' samples vs expected ' + $1 + ' samples!'; } for (var j = 0; j < $1; ++j) { channelData[j] = HEAPF32[$0 + ((j*numChannels + c) << 2) >> 2]; } } },  
- 2017777: ($0) => { var SDL2 = Module['SDL2']; if ($0) { if (SDL2.capture.silenceTimer !== undefined) { clearTimeout(SDL2.capture.silenceTimer); } if (SDL2.capture.stream !== undefined) { var tracks = SDL2.capture.stream.getAudioTracks(); for (var i = 0; i < tracks.length; i++) { SDL2.capture.stream.removeTrack(tracks[i]); } SDL2.capture.stream = undefined; } if (SDL2.capture.scriptProcessorNode !== undefined) { SDL2.capture.scriptProcessorNode.onaudioprocess = function(audioProcessingEvent) {}; SDL2.capture.scriptProcessorNode.disconnect(); SDL2.capture.scriptProcessorNode = undefined; } if (SDL2.capture.mediaStreamNode !== undefined) { SDL2.capture.mediaStreamNode.disconnect(); SDL2.capture.mediaStreamNode = undefined; } if (SDL2.capture.silenceBuffer !== undefined) { SDL2.capture.silenceBuffer = undefined } SDL2.capture = undefined; } else { if (SDL2.audio.scriptProcessorNode != undefined) { SDL2.audio.scriptProcessorNode.disconnect(); SDL2.audio.scriptProcessorNode = undefined; } SDL2.audio = undefined; } if ((SDL2.audioContext !== undefined) && (SDL2.audio === undefined) && (SDL2.capture === undefined)) { SDL2.audioContext.close(); SDL2.audioContext = undefined; } }
+  2013660: () => { return new URLSearchParams(location.search).get('qa') === '1' ? 1 : 0; },  
+ 2013735: ($0) => { console.warn('Photon: ' + UTF8ToString($0).replace(/[A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{8,}[.][A-Za-z0-9_-]{8,}|[a-fA-F0-9]{8}-[a-fA-F0-9-]{27,}|[a-fA-F0-9]{32}/g, '[redacted]')); },  
+ 2013917: () => { Module['loveLiveDeckStorage'].restore(); },  
+ 2013962: ($0) => { Module['loveLiveDeckStorage'].persist(UTF8ToString($0)); },  
+ 2014023: ($0, $1) => { Module['websocket'].subprotocol = UTF8ToString($0); Module['websocket'].url = UTF8ToString($1); if (typeof SOCKFS !== 'undefined') { SOCKFS.websocketArgs['url'] = UTF8ToString($1); SOCKFS.websocketArgs['subprotocol'] = UTF8ToString($0); } },  
+ 2014266: () => { setTimeout(function() { _siv3dMaybeAwake(); }, 0) },  
+ 2014318: () => { setTimeout(function() { _siv3dMaybeAwake(); }, 0) },  
+ 2014370: () => { if (typeof(AudioContext) !== 'undefined') { return true; } else if (typeof(webkitAudioContext) !== 'undefined') { return true; } return false; },  
+ 2014517: () => { if ((typeof(navigator.mediaDevices) !== 'undefined') && (typeof(navigator.mediaDevices.getUserMedia) !== 'undefined')) { return true; } else if (typeof(navigator.webkitGetUserMedia) !== 'undefined') { return true; } return false; },  
+ 2014751: ($0) => { if(typeof(Module['SDL2']) === 'undefined') { Module['SDL2'] = {}; } var SDL2 = Module['SDL2']; if (!$0) { SDL2.audio = {}; } else { SDL2.capture = {}; } if (!SDL2.audioContext) { if (typeof(AudioContext) !== 'undefined') { SDL2.audioContext = new AudioContext(); } else if (typeof(webkitAudioContext) !== 'undefined') { SDL2.audioContext = new webkitAudioContext(); } if (SDL2.audioContext) { autoResumeAudioContext(SDL2.audioContext); } } return SDL2.audioContext === undefined ? -1 : 0; },  
+ 2015244: () => { var SDL2 = Module['SDL2']; return SDL2.audioContext.sampleRate; },  
+ 2015312: ($0, $1, $2, $3) => { var SDL2 = Module['SDL2']; var have_microphone = function(stream) { if (SDL2.capture.silenceTimer !== undefined) { clearTimeout(SDL2.capture.silenceTimer); SDL2.capture.silenceTimer = undefined; } SDL2.capture.mediaStreamNode = SDL2.audioContext.createMediaStreamSource(stream); SDL2.capture.scriptProcessorNode = SDL2.audioContext.createScriptProcessor($1, $0, 1); SDL2.capture.scriptProcessorNode.onaudioprocess = function(audioProcessingEvent) { if ((SDL2 === undefined) || (SDL2.capture === undefined)) { return; } audioProcessingEvent.outputBuffer.getChannelData(0).fill(0.0); SDL2.capture.currentCaptureBuffer = audioProcessingEvent.inputBuffer; dynCall('vi', $2, [$3]); }; SDL2.capture.mediaStreamNode.connect(SDL2.capture.scriptProcessorNode); SDL2.capture.scriptProcessorNode.connect(SDL2.audioContext.destination); SDL2.capture.stream = stream; }; var no_microphone = function(error) { }; SDL2.capture.silenceBuffer = SDL2.audioContext.createBuffer($0, $1, SDL2.audioContext.sampleRate); SDL2.capture.silenceBuffer.getChannelData(0).fill(0.0); var silence_callback = function() { SDL2.capture.currentCaptureBuffer = SDL2.capture.silenceBuffer; dynCall('vi', $2, [$3]); }; SDL2.capture.silenceTimer = setTimeout(silence_callback, ($1 / SDL2.audioContext.sampleRate) * 1000); if ((navigator.mediaDevices !== undefined) && (navigator.mediaDevices.getUserMedia !== undefined)) { navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(have_microphone).catch(no_microphone); } else if (navigator.webkitGetUserMedia !== undefined) { navigator.webkitGetUserMedia({ audio: true, video: false }, have_microphone, no_microphone); } },  
+ 2016964: ($0, $1, $2, $3) => { var SDL2 = Module['SDL2']; SDL2.audio.scriptProcessorNode = SDL2.audioContext['createScriptProcessor']($1, 0, $0); SDL2.audio.scriptProcessorNode['onaudioprocess'] = function (e) { if ((SDL2 === undefined) || (SDL2.audio === undefined)) { return; } SDL2.audio.currentOutputBuffer = e['outputBuffer']; dynCall('vi', $2, [$3]); }; SDL2.audio.scriptProcessorNode['connect'](SDL2.audioContext['destination']); },  
+ 2017374: ($0, $1) => { var SDL2 = Module['SDL2']; var numChannels = SDL2.capture.currentCaptureBuffer.numberOfChannels; for (var c = 0; c < numChannels; ++c) { var channelData = SDL2.capture.currentCaptureBuffer.getChannelData(c); if (channelData.length != $1) { throw 'Web Audio capture buffer length mismatch! Destination size: ' + channelData.length + ' samples vs expected ' + $1 + ' samples!'; } if (numChannels == 1) { for (var j = 0; j < $1; ++j) { setValue($0 + (j * 4), channelData[j], 'float'); } } else { for (var j = 0; j < $1; ++j) { setValue($0 + (((j * numChannels) + c) * 4), channelData[j], 'float'); } } } },  
+ 2017979: ($0, $1) => { var SDL2 = Module['SDL2']; var numChannels = SDL2.audio.currentOutputBuffer['numberOfChannels']; for (var c = 0; c < numChannels; ++c) { var channelData = SDL2.audio.currentOutputBuffer['getChannelData'](c); if (channelData.length != $1) { throw 'Web Audio output buffer length mismatch! Destination size: ' + channelData.length + ' samples vs expected ' + $1 + ' samples!'; } for (var j = 0; j < $1; ++j) { channelData[j] = HEAPF32[$0 + ((j*numChannels + c) << 2) >> 2]; } } },  
+ 2018459: ($0) => { var SDL2 = Module['SDL2']; if ($0) { if (SDL2.capture.silenceTimer !== undefined) { clearTimeout(SDL2.capture.silenceTimer); } if (SDL2.capture.stream !== undefined) { var tracks = SDL2.capture.stream.getAudioTracks(); for (var i = 0; i < tracks.length; i++) { SDL2.capture.stream.removeTrack(tracks[i]); } SDL2.capture.stream = undefined; } if (SDL2.capture.scriptProcessorNode !== undefined) { SDL2.capture.scriptProcessorNode.onaudioprocess = function(audioProcessingEvent) {}; SDL2.capture.scriptProcessorNode.disconnect(); SDL2.capture.scriptProcessorNode = undefined; } if (SDL2.capture.mediaStreamNode !== undefined) { SDL2.capture.mediaStreamNode.disconnect(); SDL2.capture.mediaStreamNode = undefined; } if (SDL2.capture.silenceBuffer !== undefined) { SDL2.capture.silenceBuffer = undefined } SDL2.capture = undefined; } else { if (SDL2.audio.scriptProcessorNode != undefined) { SDL2.audio.scriptProcessorNode.disconnect(); SDL2.audio.scriptProcessorNode = undefined; } SDL2.audio = undefined; } if ((SDL2.audioContext !== undefined) && (SDL2.audio === undefined) && (SDL2.capture === undefined)) { SDL2.audioContext.close(); SDL2.audioContext = undefined; } }
 };
-
+function BeginLogin() { Module['loveCaAuth'].begin(); }
+function CancelLogin() { Module['loveCaAuth'].cancel(); }
+function LoginState() { return Module['loveCaAuth'].state(); }
+function LoginError() { return stringToNewUTF8(Module['loveCaAuth'].error()); }
+function LoginData() { return stringToNewUTF8(Module['loveCaAuth'].takePhotonData()); }
 
 
 
@@ -12277,6 +12404,11 @@ function tryParseAsDataURI(filename) {
 
 
 var asmLibraryArg = {
+  "BeginLogin": BeginLogin,
+  "CancelLogin": CancelLogin,
+  "LoginData": LoginData,
+  "LoginError": LoginError,
+  "LoginState": LoginState,
   "_ZN3s3d6System15DefaultLanguageEv": __ZN3s3d6System15DefaultLanguageEv,
   "_ZNKSt3__220__vector_base_commonILb1EE20__throw_length_errorEv": __ZNKSt3__220__vector_base_commonILb1EE20__throw_length_errorEv,
   "__assert_fail": ___assert_fail,
@@ -12666,6 +12798,11 @@ var _memcpy = Module["_memcpy"] = function() {
 };
 
 /** @type {function(...*):?} */
+var _free = Module["_free"] = function() {
+  return (_free = Module["_free"] = Module["asm"]["free"]).apply(null, arguments);
+};
+
+/** @type {function(...*):?} */
 var _ntohs = Module["_ntohs"] = function() {
   return (_ntohs = Module["_ntohs"] = Module["asm"]["ntohs"]).apply(null, arguments);
 };
@@ -12678,11 +12815,6 @@ var ___errno_location = Module["___errno_location"] = function() {
 /** @type {function(...*):?} */
 var _htons = Module["_htons"] = function() {
   return (_htons = Module["_htons"] = Module["asm"]["htons"]).apply(null, arguments);
-};
-
-/** @type {function(...*):?} */
-var _free = Module["_free"] = function() {
-  return (_free = Module["_free"] = Module["asm"]["free"]).apply(null, arguments);
 };
 
 /** @type {function(...*):?} */
@@ -13108,11 +13240,6 @@ var dynCall_did = Module["dynCall_did"] = function() {
 /** @type {function(...*):?} */
 var dynCall_viiiidi = Module["dynCall_viiiidi"] = function() {
   return (dynCall_viiiidi = Module["dynCall_viiiidi"] = Module["asm"]["dynCall_viiiidi"]).apply(null, arguments);
-};
-
-/** @type {function(...*):?} */
-var dynCall_j = Module["dynCall_j"] = function() {
-  return (dynCall_j = Module["dynCall_j"] = Module["asm"]["dynCall_j"]).apply(null, arguments);
 };
 
 /** @type {function(...*):?} */
@@ -13641,6 +13768,11 @@ var dynCall_iidiiii = Module["dynCall_iidiiii"] = function() {
 };
 
 /** @type {function(...*):?} */
+var dynCall_j = Module["dynCall_j"] = function() {
+  return (dynCall_j = Module["dynCall_j"] = Module["asm"]["dynCall_j"]).apply(null, arguments);
+};
+
+/** @type {function(...*):?} */
 var dynCall_iiiiij = Module["dynCall_iiiiij"] = function() {
   return (dynCall_iiiiij = Module["dynCall_iiiiij"] = Module["asm"]["dynCall_iiiiij"]).apply(null, arguments);
 };
@@ -13680,7 +13812,8 @@ var _asyncify_stop_rewind = Module["_asyncify_stop_rewind"] = function() {
   return (_asyncify_stop_rewind = Module["_asyncify_stop_rewind"] = Module["asm"]["asyncify_stop_rewind"]).apply(null, arguments);
 };
 
-
+var ___start_em_js = Module['___start_em_js'] = 2019631;
+var ___stop_em_js = Module['___stop_em_js'] = 2019896;
 function invoke_viii(index,a1,a2,a3) {
   var sp = stackSave();
   try {
@@ -15078,17 +15211,6 @@ function invoke_jiij(index,a1,a2,a3,a4) {
   }
 }
 
-function invoke_j(index) {
-  var sp = stackSave();
-  try {
-    return dynCall_j(index);
-  } catch(e) {
-    stackRestore(sp);
-    if (e !== e+0) throw e;
-    _setThrew(1, 0);
-  }
-}
-
 function invoke_viiij(index,a1,a2,a3,a4,a5) {
   var sp = stackSave();
   try {
@@ -15137,6 +15259,17 @@ function invoke_vidj(index,a1,a2,a3,a4) {
   var sp = stackSave();
   try {
     dynCall_vidj(index,a1,a2,a3,a4);
+  } catch(e) {
+    stackRestore(sp);
+    if (e !== e+0) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_j(index) {
+  var sp = stackSave();
+  try {
+    return dynCall_j(index);
   } catch(e) {
     stackRestore(sp);
     if (e !== e+0) throw e;
